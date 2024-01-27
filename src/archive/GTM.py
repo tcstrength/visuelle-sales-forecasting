@@ -1,15 +1,13 @@
-import math, os
+import math
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from transformers import pipeline
 from torchvision import models
-from pathlib import Path
-from torch.optim.lr_scheduler import LambdaLR
 from fairseq.optim.adafactor import Adafactor
 
+DEVICE = "mps" if getattr(torch,'has_mps',False) else "gpu" if torch.cuda.is_available() else "cpu"
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=52):
@@ -74,6 +72,7 @@ class FusionNetwork(nn.Module):
         # Fuse static features together
         pooled_img = self.img_pool(img_encoding)
         condensed_img = self.img_linear(pooled_img.flatten(1))
+        
         if self.input_type == 3:
             concat_features = torch.cat([condensed_img, text_encoding, dummy_encoding], dim=1) # no img
         elif self.input_type == 2:
@@ -105,12 +104,12 @@ class POPEmbedder(nn.Module):
         split = math.gcd(size, forecast_horizon)
         for i in range(0, size, split):
             mask[i:i+split, i:i+split] = 1
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to('cuda:'+str(self.gpu_num))
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to(DEVICE)
         return mask
     
     def _generate_square_subsequent_mask(self, size):
         mask = (torch.triu(torch.ones(size, size)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to('cuda:'+str(self.gpu_num))
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to(DEVICE)
         return mask
 
     def forward(self, trend):
@@ -147,8 +146,8 @@ class TextEmbedder(nn.Module):
 
         # BERT gives us embeddings for [CLS] ..  [EOS], which is why we only average the embeddings in the range [1:-1] 
         # We're not fine tuning BERT and we don't want the noise coming from [CLS] or [EOS]
-        word_embeddings = [torch.FloatTensor(x[1:-1]).mean(axis=0) for x in word_embeddings] 
-        word_embeddings = torch.stack(word_embeddings).to('cuda:'+str(self.gpu_num))
+        word_embeddings = [torch.FloatTensor(x[0][1:-1]).mean(axis=0) for x in word_embeddings] 
+        word_embeddings = torch.stack(word_embeddings).to(DEVICE)
         
         # Embed to our embedding space
         word_embeddings = self.dropout(self.fc(word_embeddings))
@@ -263,9 +262,13 @@ class GTM(pl.LightningModule):
             nn.Linear(hidden_dim, self.output_len if not self.autoregressive else 1),
             nn.Dropout(0.2)
         )
+        self.val_step_targets = []
+        self.val_step_outputs = []        # save outputs in each batch to compute metric overall epoch
+
+
     def _generate_square_subsequent_mask(self, size):
         mask = (torch.triu(torch.ones(size, size)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to('cuda:'+str(self.gpu_num))
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to(DEVICE)
         return mask
 
     def forward(self, attrs, temporal_features, pop_signal, images):
@@ -280,7 +283,7 @@ class GTM(pl.LightningModule):
 
         if self.autoregressive:
             # Decode
-            tgt = torch.zeros(self.output_len, pop_signal_encoding.shape[1], pop_signal_encoding.shape[-1]).to('cuda:'+str(self.gpu_num))
+            tgt = torch.zeros(self.output_len, pop_signal_encoding.shape[1], pop_signal_encoding.shape[-1]).to(DEVICE)
             tgt[0] = static_feature_fusion
             tgt = self.pos_encoder(tgt)
             tgt_mask = self._generate_square_subsequent_mask(self.output_len)
@@ -306,6 +309,7 @@ class GTM(pl.LightningModule):
         item_sales, attrs, temporal_features, vis_trend, images = train_batch 
         forecasted_sales, _ = self.forward(attrs, temporal_features, vis_trend, images)
         loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
+        
         self.log('train_loss', loss)
 
         return loss
@@ -313,16 +317,23 @@ class GTM(pl.LightningModule):
     def validation_step(self, train_batch, batch_idx):
         item_sales, attrs, temporal_features, vis_trend, images = train_batch 
         forecasted_sales, _ = self.forward(attrs, temporal_features, vis_trend, images)
-        
+
+        loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
+        rescaled_item_sales, rescaled_forecasted_sales = item_sales*1065, forecasted_sales*1065
+        mae = F.l1_loss(rescaled_item_sales, rescaled_forecasted_sales)
+        self.log('val_loss', loss)
+        self.log('val_mae', mae)
         return item_sales.squeeze(), forecasted_sales.squeeze()
 
-    def validation_epoch_end(self, val_step_outputs):
-        item_sales, forecasted_sales = [x[0] for x in val_step_outputs], [x[1] for x in val_step_outputs]
-        item_sales, forecasted_sales = torch.stack(item_sales), torch.stack(forecasted_sales)
-        rescaled_item_sales, rescaled_forecasted_sales = item_sales*1065, forecasted_sales*1065 # 1065 is the normalization factor (max of the sales of the training set)
-        loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
-        mae = F.l1_loss(rescaled_item_sales, rescaled_forecasted_sales)
-        self.log('val_mae', mae)
-        self.log('val_loss', loss)
+    # def on_validation_epoch_end(self):
+    #     item_sales = torch.stack(self.val_step_targets)
+    #     forecasted_sales = torch.stack(self.val_step_outputs)
+    #     rescaled_item_sales, rescaled_forecasted_sales = item_sales*1065, forecasted_sales*1065 # 1065 is the normalization factor (max of the sales of the training set)
+    #     loss = F.mse_loss(item_sales, forecasted_sales)
+    #     mae = F.l1_loss(rescaled_item_sales, rescaled_forecasted_sales)
+    #     self.log('val_mae', mae)
+    #     self.log('val_loss', loss)
 
-        print('Validation MAE:', mae.detach().cpu().numpy(), 'LR:', self.optimizers().param_groups[0]['lr'])
+    #     print('Validation MAE:', mae.detach().cpu().numpy(), 'LR:', self.optimizers().param_groups[0]['lr'])
+    #     self.val_step_outputs.clear()
+    #     self.val_step_targets.clear()

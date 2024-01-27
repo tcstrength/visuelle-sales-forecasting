@@ -1,12 +1,10 @@
 import os
 import torch
 import pandas as pd
-import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 from PIL import Image
 from tqdm import tqdm
 from torchvision.transforms import Resize, ToTensor, Normalize, Compose
-from sklearn.preprocessing import MinMaxScaler
 
 class POPDataset():
     def __init__(self, data_df, img_root, pop_signal, cat_dict, col_dict, fab_dict, trend_len):
