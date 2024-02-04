@@ -19,15 +19,25 @@ def get_pytorch_device() -> str:
     return "cpu"
 
 
-def cal_error_metrics(gt, forecasts):
-    # Absolute errors
-    mae = mean_absolute_error(gt, forecasts)
-    wape = 100 * np.sum(np.sum(np.abs(gt - forecasts), axis=-1)) / np.sum(gt)
-
-    return round(mae, 3), round(wape, 3)
+def force_numpy(gt, forecasts):
+    if torch.is_tensor(gt):
+        gt = gt.detach().cpu().numpy()
     
+    if torch.is_tensor(forecasts):
+        forecasts = forecasts.detach().cpu().numpy()
+    
+    return gt, forecasts
 
-def print_error_metrics(y_test, y_hat, rescaled_y_test, rescaled_y_hat):
-    mae, wape = cal_error_metrics(y_test, y_hat)
-    rescaled_mae, rescaled_wape = cal_error_metrics(rescaled_y_test, rescaled_y_hat)
-    print(mae, wape, rescaled_mae, rescaled_wape)
+def cal_mae(gt, forecasts, sales_scale):
+    gt, forecasts = force_numpy(gt, forecasts)
+    gt = gt * sales_scale
+    forecasts = forecasts * sales_scale
+    mae = mean_absolute_error(gt, forecasts)
+    return round(mae, 3)
+
+
+def cal_wape(gt, forecasts):
+    gt, forecasts = force_numpy(gt, forecasts)
+    wape = 100 * np.sum(np.sum(np.abs(gt - forecasts), axis=-1)) / np.sum(gt)
+    return round(wape, 3)
+    

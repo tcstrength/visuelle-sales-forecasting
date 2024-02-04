@@ -2,6 +2,8 @@
 dataset/
 wandb/
 ckpt/
+lightning_logs/*
+mlruns/
 *.json
 
 # Byte-compiled / optimized / DLL files

@@ -15,50 +15,49 @@ sys.path.append(f"{os.getcwd()}/src")
 
 import os
 import pytorch_lightning as L
-import warnings
-import numpy as np
+import mlflow
 from utils import misc_utils
 from models import VisuelleDataset
-# from models import VisForecastNet
-from models import GTrendModel
+from models import FusionModel
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
 
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "False"
     device = misc_utils.get_pytorch_device()
 
     visuelle = VisuelleDataset(data_dir="dataset/")
-    train_loader = visuelle.get_data_loader(train=True, batch_size=64)
-    test_loader = visuelle.get_data_loader(train=False, batch_size=64)
+    train_loader = visuelle.get_data_loader(train=True, batch_size=64, sample_frac=None)
+    test_loader = visuelle.get_data_loader(train=False, batch_size=64, sample_frac=None)
 
-    # from models import VisForecastNet # Refresh Module
-    # attrs_dict = [visuelle.col_id_to_str, visuelle.fab_id_to_str, visuelle.cat_id_to_str]
-    # vfn = VisForecastNet(
-    #     hidden_dim=64, output_dim=12, embedding_dim=32, attrs_dict=attrs_dict, dropout=0.2,
-    #     device = device
-    # )
+    with mlflow.start_run():
+        L.seed_everything(21)
+        model = FusionModel(
+            num_trends=3, vtrend_len=14*7, gtrend_len=52, hidden_dim=32, output_dim=12,
+            temporal_len=4, fusion_dim=32, sales_scale=visuelle.target_scaler
+        )
+        
+        targets, attrs, temporals, gtrends, vtrends = train_loader.dataset[0:3]
+        params = (
+            model.vtrends_encoder(vtrends),
+            model.gtrends_encoder(gtrends),
+            model.temporal_encoder(temporals)
+        )
 
-    L.seed_everything(21)
-    model = GTrendModel(
-        num_trends=3, trend_len=52, hidden_dim=32, output_dim=12, dropout=0.2
-    )
-    targets, _, _, gtrends = train_loader.dataset[0:3]
-    model.forward(None, None, gtrends)
-
-    trainer = L.Trainer(
-        accelerator=device, devices=1, max_epochs=40, log_every_n_steps=5, 
-        check_val_every_n_epoch=5
-    )
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=test_loader)
-    
-    targets, _, _, gtrends = test_loader.dataset[0:]
-    predictions = model.forward(None, None, gtrends)
-    y_test = targets.detach().numpy()
-    y_hat = predictions.detach().numpy()
-    
-    misc_utils.print_error_metrics(y_test, y_hat, y_test * visuelle.target_scaler, y_hat * visuelle.target_scaler)
+        trainer = L.Trainer(
+            accelerator=device, devices=1, max_epochs=40, log_every_n_steps=50, 
+            check_val_every_n_epoch=1
+        )
+        trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=test_loader)
+        
+        targets, attrs, temporals, gtrends, vtrends = test_loader.dataset[0:]
+        predicts = model.forward(temporals, gtrends, vtrends)
+        
+        mlflow.log_metrics({
+            "final_mae": misc_utils.cal_mae(targets, predicts, visuelle.target_scaler),
+            "final_wape": misc_utils.cal_wape(targets, predicts)
+        })
+        mlflow.pytorch.log_model(model, "model", code_paths=["src/models"])
+        mlflow.end_run()
     
 
 # All the strategies apply the same seed=21
